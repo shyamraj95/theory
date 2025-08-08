@@ -1,4 +1,42 @@
+-- The "Dossier" Query: Trace a single record across all tables
+WITH latest_completed_verif AS (
+    SELECT APP_SEQ_ID, CREATED_DT
+    FROM (
+        SELECT
+            avp_inner.APP_SEQ_ID,
+            avp_inner.CREATED_DT,
+            ROW_NUMBER() OVER (PARTITION BY avp_inner.APP_SEQ_ID ORDER BY avp_inner.CREATED_DT DESC) as rn
+        FROM APP_VERIF_PROCESS_TX avp_inner
+        WHERE avp_inner.STS_CODE = 'ST08' AND avp_inner.ACTION = 'FINAL' AND avp_inner.VERIF_TYPE_CODE = 'TTLV'
+    )
+    WHERE rn = 1
+)
+SELECT
+    av.APP_SEQ_ID,
+    av.APP_VERIF_ID,
+    av.STS_CODE as main_status,
+    av.ASSIGN_DT as assignment_date,
+    lcv.CREATED_DT as completion_date, -- This comes from the history table
+    TRUNC(
+        CASE
+            WHEN 'COMPLETED' = 'COMPLETED' THEN lcv.CREATED_DT -- Checking the 'COMPLETED' path
+            ELSE SYSDATE
+        END
+    ) - TRUNC(av.ASSIGN_DT) AS days_diff_if_completed,
+    TRUNC(
+        CASE
+            WHEN 'PENDING' = 'COMPLETED' THEN lcv.CREATED_DT -- Checking the 'PENDING' path
+            ELSE SYSDATE
+        END
+    ) - TRUNC(av.ASSIGN_DT) AS days_diff_if_pending,
+    bm.CTR_CODE
+FROM APP_VERIF_TX av
+INNER JOIN APP_TX at ON av.APP_SEQ_ID = at.APP_SEQ_ID
+INNER JOIN BRANCH_MS bm ON at.BRN_CODE = bm.BRN_CODE
+LEFT JOIN latest_completed_verif lcv ON av.APP_SEQ_ID = lcv.APP_SEQ_ID
+WHERE av.APP_SEQ_ID = [Your_Problem_App_Seq_Id];
 
+/////
 
     @Query(value =
         // Step 1: Create a precise lookup for the single, latest, official completion date.
