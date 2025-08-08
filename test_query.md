@@ -1,41 +1,50 @@
--- The "Dossier" Query: Trace a single record across all tables
 WITH latest_completed_verif AS (
-    SELECT APP_SEQ_ID, CREATED_DT
+    SELECT APP_VERIF_ID, CREATED_DT
     FROM (
         SELECT
-            avp_inner.APP_SEQ_ID,
-            avp_inner.CREATED_DT,
-            ROW_NUMBER() OVER (PARTITION BY avp_inner.APP_SEQ_ID ORDER BY avp_inner.CREATED_DT DESC) as rn
-        FROM APP_VERIF_PROCESS_TX avp_inner
-        WHERE avp_inner.STS_CODE = 'ST08' AND avp_inner.ACTION = 'FINAL' AND avp_inner.VERIF_TYPE_CODE = 'TTLV'
+            avp.APP_VERIF_ID,
+            avp.CREATED_DT,
+            ROW_NUMBER() OVER (
+                PARTITION BY avp.APP_VERIF_ID
+                ORDER BY avp.CREATED_DT DESC
+            ) rn
+        FROM APP_VERIF_PROCESS_TX avp
+        WHERE avp.STS_CODE = 'ST08'
+          AND avp.ACTION = 'FINAL'
+          AND avp.VERIF_TYPE_CODE = :verifTypeCode
     )
     WHERE rn = 1
+),
+data_with_age AS (
+    SELECT
+        CASE 
+            WHEN :statusType = 'COMPLETED'
+                THEN TRUNC(lcv.CREATED_DT) - TRUNC(av.ASSIGN_DT)
+            ELSE TRUNC(SYSDATE) - TRUNC(av.ASSIGN_DT)
+        END AS days_diff
+    FROM APP_VERIF_TX av
+    JOIN APP_TX at ON av.APP_SEQ_ID = at.APP_SEQ_ID
+    JOIN BRANCH_MS bm ON at.BRN_CODE = bm.BRN_CODE
+    LEFT JOIN latest_completed_verif lcv ON av.APP_VERIF_ID = lcv.APP_VERIF_ID
+    WHERE bm.CIR_CODE = :cirCode
+      AND av.VERIF_TYPE_CODE = :verifTypeCode
+      AND av.ASSIGN_DT BETWEEN :fromDate AND :toDate
+      AND (
+          (:statusType = 'PENDING' 
+              AND av.STS_CODE IN ('ST02', 'ST06', 'ST14'))
+          OR
+          (:statusType = 'COMPLETED'
+              AND av.STS_CODE = 'ST08'
+              AND lcv.CREATED_DT IS NOT NULL)
+      )
 )
 SELECT
-    av.APP_SEQ_ID,
-    av.APP_VERIF_ID,
-    av.STS_CODE as main_status,
-    av.ASSIGN_DT as assignment_date,
-    lcv.CREATED_DT as completion_date, -- This comes from the history table
-    TRUNC(
-        CASE
-            WHEN 'COMPLETED' = 'COMPLETED' THEN lcv.CREATED_DT -- Checking the 'COMPLETED' path
-            ELSE SYSDATE
-        END
-    ) - TRUNC(av.ASSIGN_DT) AS days_diff_if_completed,
-    TRUNC(
-        CASE
-            WHEN 'PENDING' = 'COMPLETED' THEN lcv.CREATED_DT -- Checking the 'PENDING' path
-            ELSE SYSDATE
-        END
-    ) - TRUNC(av.ASSIGN_DT) AS days_diff_if_pending,
-    bm.CTR_CODE
-FROM APP_VERIF_TX av
-INNER JOIN APP_TX at ON av.APP_SEQ_ID = at.APP_SEQ_ID
-INNER JOIN BRANCH_MS bm ON at.BRN_CODE = bm.BRN_CODE
-LEFT JOIN latest_completed_verif lcv ON av.APP_SEQ_ID = lcv.APP_SEQ_ID
-WHERE av.APP_SEQ_ID = [Your_Problem_App_Seq_Id];
-
+    NVL(SUM(CASE WHEN days_diff <= 10 THEN 1 ELSE 0 END), 0) AS lessThan10Days,
+    NVL(SUM(CASE WHEN days_diff BETWEEN 11 AND 20 THEN 1 ELSE 0 END), 0) AS between11To20Days,
+    NVL(SUM(CASE WHEN days_diff BETWEEN 21 AND 30 THEN 1 ELSE 0 END), 0) AS between21To30Days,
+    NVL(SUM(CASE WHEN days_diff > 30 THEN 1 ELSE 0 END), 0) AS moreThan30Days,
+    COUNT(*) AS totalCount
+FROM data_with_age;
 /////
 
     @Query(value =
