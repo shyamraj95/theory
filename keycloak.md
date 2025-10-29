@@ -760,6 +760,195 @@ In summary, CAPTCHA is plug-and-play with reCAPTCHA, while OTP is robust for app
 ///////////////////////
 
 
+
+### Customizing Keycloak's Built-in Login Page for Encryption, OTP, CAPTCHA, and Styling
+
+Since you're sticking with Keycloak's hosted login page (no custom SPA UI), that's the right call for security and simplicity—it keeps credential handling server-side. You can fully customize it using **Keycloak themes** (Freemarker templates + CSS/JS) for styling and client-side logic (e.g., encryption), plus **SPIs** for server-side features like OTP/CAPTCHA validation. This integrates seamlessly with your Angular SPA's PKCE flow: the SPA redirects to Keycloak's login, user authenticates there, and redirects back with tokens.
+
+Below, I'll outline implementation for each feature, with steps and snippets. Assume you're working in a custom theme (e.g., `my-theme` in `themes/login/my-theme/`).
+
+#### 1. **Styling the Login Page**
+   - **Approach**: Override Freemarker templates and add custom CSS/JS. No SPIs needed.
+   - **Steps**:
+     1. Create a theme: In Keycloak's `themes/` dir, copy the `keycloak` theme to `my-theme` (for login type).
+     2. Edit `login.ftl` (main template) for layout changes (e.g., add branding).
+     3. Add CSS to `theme.properties` and `resources/css/login.css`.
+     4. Assign theme: Admin Console > Realm Settings > Themes > Login Theme = `my-theme`.
+   - **Example Snippet** (`login.ftl` for custom header):
+     ```ftl
+     <#import "template.ftl" as layout>
+     <@layout.registrationLayout displayInfo=true; section>
+         <#if section = "header">
+             <div id="kc-header" class="${properties.kcHeaderClass!}">
+                 <div id="kc-header-wrapper" class="${properties.kcHeaderWrapperClass!}">
+                     <img src="${url.resourcesPath}/img/my-logo.png" alt="My App" />
+                     <h1>My Secure App</h1>
+                 </div>
+             </div>
+         <#elseif section = "form">
+             <!-- Default form with custom classes -->
+             <div class="custom-form-wrapper">
+                 <form id="kc-form-login" action="${url.loginAction}" method="post">
+                     <!-- Username/Password fields with custom styling -->
+                     <input type="text" id="username" class="custom-input" name="username" />
+                     <input type="password" id="password" class="custom-input" name="password" />
+                 </form>
+             </div>
+         </#if>
+     </@layout.registrationLayout>
+     ```
+   - **CSS Example** (`resources/css/login.css`):
+     ```css
+     .custom-form-wrapper { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 2rem; border-radius: 10px; }
+     .custom-input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; }
+     ```
+   - **Result**: Branded, responsive page without touching Angular.
+
+#### 2. **Adding CAPTCHA**
+   - **Approach**: Use Keycloak's native Google reCAPTCHA (v2/v3) for easy integration, or custom via SPI for your Java AWT-generated CAPTCHA.
+   - **Native reCAPTCHA (Recommended for Quick Start)**:
+     1. Admin Console > Realm Settings > Login > Enable "reCAPTCHA" > Enter site/secret keys.
+     2. It auto-injects into `login.ftl` (checkbox or invisible challenge).
+     3. For styling: Override the reCAPTCHA div in CSS (e.g., `.g-recaptcha { transform: scale(0.8); }`).
+   - **Custom CAPTCHA (Ties to Your Caffeine-Cached AWT Image)**:
+     1. Implement a **FormAction SPI** to generate/serve CAPTCHA image and validate against Caffeine cache.
+     2. In theme, add JS to fetch/display image and submit solution.
+   - **Example SPI Snippet** (CustomCaptchaFormAction.java – extends FormAction):
+     ```java
+     public class CustomCaptchaFormAction extends AbstractFormAction {
+         @Override
+         public void validate(ValidationContext context) {
+             String solution = context.getHttpRequest().getDecodedFormParameters().getFirst("captcha_solution");
+             String sessionId = context.getSession().getId();
+             String cachedSolution = captchaService.getCachedSolution(sessionId); // Caffeine lookup
+             if (!solution.equals(cachedSolution)) {
+                 context.getEvent().error(Errors.INVALID_USER_CREDENTIALS);
+                 response.setError("Invalid CAPTCHA");
+                 return;
+             }
+             // Proceed to next step
+             context.success();
+         }
+
+         @Override
+         public void buildPage(FormContext context) {
+             // Generate image URL or base64
+             String captchaImage = captchaService.generateAndCache(sessionId); // Returns base64
+             context.getContext().setAttribute("captchaImage", captchaImage);
+         }
+     }
+     ```
+     - Factory/Registration: As in prior SPI examples.
+     - In `login.ftl`: `<img src="data:image/png;base64,${captchaImage}" /> <input name="captcha_solution" />`.
+   - **Integration**: Add the FormAction to your browser flow (Admin > Authentication > Flows > Browser > Add execution = Custom CAPTCHA).
+
+#### 3. **Adding OTP**
+   - **Approach**: Use built-in TOTP for app-based OTP, or custom FormAction SPI for email/SMS (integrate your internal service).
+   - **Built-in TOTP (Quick)**:
+     1. Admin > Authentication > Flows > Add "OTP Form" after password step.
+     2. Users enroll via "Configure OTP" required action (QR code in theme).
+     3. Styling: Customize `otp.ftl` template similarly to `login.ftl`.
+   - **Custom SMS/Email OTP (For External Users)**:
+     1. After password validation, use FormAction to send OTP via your service, then prompt in a custom form.
+   - **Example SPI Snippet** (OtpFormAction.java):
+     ```java
+     public class OtpFormAction extends AbstractFormAction {
+         @Override
+         public void buildPage(FormContext context) {
+             // If post-password, send OTP
+             if (context.getAuthenticationSession().getAuthNote("passwordValidated") != null) {
+                 String username = context.getUser() != null ? context.getUser().getUsername() : "";
+                 String otp = otpService.generateAndSend(username); // Call internal SMS/Email
+                 context.getAuthenticationSession().setAuthNote("pendingOtp", otp);
+                 context.getContext().setAttribute("otpSent", true);
+             }
+         }
+
+         @Override
+         public void validate(ValidationContext context) {
+             String userOtp = context.getHttpRequest().getDecodedFormParameters().getFirst("otp");
+             String pendingOtp = context.getAuthenticationSession().getAuthNote("pendingOtp");
+             if (!userOtp.equals(pendingOtp)) {
+                 context.getEvent().error(Errors.INVALID_USER_CREDENTIALS);
+                 return;
+             }
+             context.success();
+         }
+     }
+     ```
+     - In `login-otp.ftl` (custom template): `<input name="otp" placeholder="Enter OTP" />`.
+     - Flow: Insert after "Username Password Form" in browser flow.
+
+#### 4. **Adding Encryption to Login Payload**
+   - **Approach**: Since the form submits to Keycloak's server-side endpoint, add client-side JS in the theme to encrypt the payload (hybrid RSA-AES) before POST. Fetch public key from Keycloak (e.g., via a custom endpoint or JWKS). This mirrors your resource server encryption but for auth.
+   - **Challenges**: Keycloak doesn't natively encrypt forms, so JS handles it. Use Web Crypto API (no libs needed).
+   - **Steps**:
+     1. Add JS to theme's `resources/js/login.js`.
+     2. Override form submit in `login.ftl`: `<form onsubmit="encryptAndSubmit(event)">`.
+     3. Server-side: Extend Keycloak's login action to decrypt (custom Authenticator SPI).
+   - **Example JS Snippet** (`login.js`):
+     ```javascript
+     async function encryptAndSubmit(event) {
+         event.preventDefault();
+         const form = event.target;
+         const username = form.username.value;
+         const password = form.password.value;
+         const captcha = form.captcha_solution?.value;
+         const otp = form.otp?.value;
+
+         const payload = JSON.stringify({ username, password, captcha, otp });
+         // Fetch RSA pub key (e.g., from /jwks or custom endpoint)
+         const pubKeyResponse = await fetch('/realms/myrealm/protocol/openid-connect/certs');
+         const pubKey = await pubKeyResponse.json(); // Use first key or custom
+
+         // Hybrid encrypt (Web Crypto)
+         const aesKey = await window.crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt']);
+         const iv = window.crypto.subtle.generateRandom(12);
+         const encryptedPayload = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, new TextEncoder().encode(payload));
+
+         const exportedAes = await window.crypto.subtle.exportKey('raw', aesKey);
+         const rsaKey = await window.crypto.subtle.importKey('jwk', pubKey.keys[0], { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['encrypt']);
+         const encryptedAesKey = await window.crypto.subtle.encrypt({ name: 'RSA-OAEP' }, rsaKey, exportedAes);
+
+         // Submit encrypted form data
+         const formData = new FormData();
+         formData.append('encrypted_payload', btoa(String.fromCharCode(...new Uint8Array(encryptedPayload))));
+         formData.append('encrypted_aes_key', btoa(String.fromCharCode(...new Uint8Array(encryptedAesKey))));
+         formData.append('iv', btoa(String.fromCharCode(...new Uint8Array(iv))));
+         formData.append('nonce', crypto.randomUUID());
+         formData.append('timestamp', Date.now());
+
+         fetch(form.action, { method: 'POST', body: formData }).then(() => location.reload());
+     }
+     ```
+   - **Server-Side Decryption**: In a custom `UsernamePasswordForm` (Authenticator SPI override):
+     ```java
+     // In validate() method
+     String encryptedPayload = formData.getFirst("encrypted_payload");
+     // Decrypt using RSA private key (from Keycloak's key store) and provided AES/IV
+     // Similar to your EncryptionService in Spring Boot
+     String decrypted = encryptionService.decryptPayload(encryptedPayload, encryptedAesKey, iv);
+     JsonNode json = objectMapper.readTree(decrypted);
+     String username = json.get("username").asText();
+     // Proceed with auth
+     ```
+   - **Note**: For replay protection, validate nonce/timestamp server-side. Test thoroughly—encryption adds latency.
+
+### Integration with Your System
+- **Flow Update**: In the Mermaid diagram (from prior), the login redirect (step 4) now includes these custom elements in Keycloak's page.
+- **Testing**: Use Keycloak's dev mode (`kc.sh start-dev`) with theme enabled. Ensure Angular's redirect URI matches.
+- **Best Practices**: Keep JS minimal (bundle via theme resources). For production, audit for OWASP (e.g., secure key handling). If encryption feels heavy for login, consider it optional here and enforce on resource server APIs only.
+
+This keeps everything in Keycloak without SPA custom UI. If you need full SPI code or theme ZIP, let me know!
+
+
+
+
+
+
+//////////////////////////
+
+
 # OAuth 2.1/OIDC Authentication & Authorization System
 ## Technical Design Document v1.0
 
