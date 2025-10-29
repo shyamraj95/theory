@@ -353,3 +353,820 @@ public class EncryptedPayloadFilter extends OncePerRequestFilter {
 
 *Document generated: system-design / security & application architecture for OAuth2.1 + OIDC with Keycloak, Spring Boot 3.x, Java 21 and Angular 20.*
 
+
+
+
+
+////////////////////////////////////
+
+
+
+
+
+Excellent 👏 — this is where we make your **Keycloak ↔ External Role Validation** integration fully production-ready.
+
+Below is a **complete implementation blueprint** for your **Custom Keycloak Authenticator SPI** project, including:
+✅ Project structure
+✅ Maven configuration
+✅ Java classes
+✅ Flow XML configuration (to register in Keycloak)
+✅ Step-by-step Keycloak admin setup
+
+---
+
+## 🏗️ 1. Project Structure — `keycloak-external-role-validator`
+
+```
+keycloak-external-role-validator/
+├── pom.xml
+├── src/
+│   ├── main/
+│   │   ├── java/com/spleenior/keycloak/rolevalidator/
+│   │   │   ├── ExternalRoleValidatorFactory.java
+│   │   │   ├── ExternalRoleValidatorAuthenticator.java
+│   │   │   ├── ExternalRoleApiClient.java
+│   │   │   ├── RoleValidationResponse.java
+│   │   │   └── CaffeineCacheProvider.java
+│   │   └── resources/
+│   │       ├── META-INF/services/org.keycloak.authentication.AuthenticatorFactory
+│   │       ├── META-INF/services/org.keycloak.authentication.Authenticator
+│   │       └── external-role-validator-flow.xml
+│   └── test/java/... (optional)
+```
+
+---
+
+## ⚙️ 2. Maven Dependencies
+
+Use a Keycloak version that matches your server (e.g., 24.x or 25.x).
+
+```xml
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.spleenior.keycloak</groupId>
+  <artifactId>external-role-validator</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.keycloak</groupId>
+      <artifactId>keycloak-server-spi</artifactId>
+      <version>${keycloak.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.keycloak</groupId>
+      <artifactId>keycloak-server-spi-private</artifactId>
+      <version>${keycloak.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>2.0.12</version>
+    </dependency>
+    <dependency>
+      <groupId>com.github.ben-manes.caffeine</groupId>
+      <artifactId>caffeine</artifactId>
+      <version>3.1.8</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.httpcomponents.client5</groupId>
+      <artifactId>httpclient5</artifactId>
+      <version>5.3</version>
+    </dependency>
+  </dependencies>
+</project>
+```
+
+---
+
+## 🧠 3. Core Java Classes
+
+### (a) `ExternalRoleValidatorAuthenticator.java`
+
+```java
+package com.spleenior.keycloak.rolevalidator;
+
+import org.keycloak.authentication.*;
+import org.keycloak.models.*;
+import org.keycloak.services.managers.AuthenticationManager;
+import org.keycloak.services.validation.Validation;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class ExternalRoleValidatorAuthenticator implements Authenticator {
+
+    private static final Logger log = LoggerFactory.getLogger(ExternalRoleValidatorAuthenticator.class);
+    private final ExternalRoleApiClient apiClient = new ExternalRoleApiClient();
+    private final CaffeineCacheProvider cache = CaffeineCacheProvider.getInstance();
+
+    @Override
+    public void authenticate(AuthenticationFlowContext context) {
+        UserModel user = context.getUser();
+        String username = user.getUsername();
+        String primaryRole = user.getFirstAttribute("primaryRole");
+
+        if (Validation.isBlank(primaryRole)) {
+            log.warn("User {} does not have a primaryRole attribute", username);
+            context.success();
+            return;
+        }
+
+        // Check cache first
+        String cacheKey = username + "_" + primaryRole;
+        Boolean cachedValid = cache.get(cacheKey);
+        if (cachedValid != null && cachedValid) {
+            log.info("Role validation (cached) passed for {}", username);
+            context.success();
+            return;
+        }
+
+        // Call external API
+        RoleValidationResponse result = apiClient.validateRole(username, primaryRole);
+        if (result != null && result.valid()) {
+            log.info("External role validation succeeded for {}", username);
+            user.setSingleAttribute("circleId", result.circleId());
+            user.setSingleAttribute("branchId", result.branchId());
+            user.setSingleAttribute("raccpId", result.raccpId());
+            cache.put(cacheKey, true);
+            context.success();
+        } else {
+            log.error("Role validation failed for user {}", username);
+            context.cancelLogin();
+            context.failure(AuthenticationFlowError.INVALID_USER,
+                context.form().setError("Role verification failed. Contact admin.").createErrorPage());
+        }
+    }
+
+    @Override public void action(AuthenticationFlowContext context) {}
+    @Override public boolean requiresUser() { return true; }
+    @Override public boolean configuredFor(KeycloakSession session, RealmModel realm, UserModel user) { return true; }
+    @Override public void setRequiredActions(KeycloakSession session, RealmModel realm, UserModel user) {}
+    @Override public void close() {}
+}
+```
+
+---
+
+### (b) `ExternalRoleValidatorFactory.java`
+
+```java
+package com.spleenior.keycloak.rolevalidator;
+
+import org.keycloak.authentication.Authenticator;
+import org.keycloak.authentication.AuthenticatorFactory;
+import org.keycloak.models.KeycloakSession;
+import org.keycloak.provider.ProviderConfigProperty;
+
+import java.util.List;
+
+public class ExternalRoleValidatorFactory implements AuthenticatorFactory {
+
+    public static final String PROVIDER_ID = "external-role-validator";
+
+    @Override public String getId() { return PROVIDER_ID; }
+    @Override public String getDisplayType() { return "External Role Validator"; }
+    @Override public String getHelpText() { return "Validates internal user roles (COD, CPC Head) via external API"; }
+    @Override public Authenticator create(KeycloakSession session) { return new ExternalRoleValidatorAuthenticator(); }
+
+    @Override public boolean isConfigurable() { return false; }
+    @Override public List<ProviderConfigProperty> getConfigProperties() { return List.of(); }
+    @Override public void init(org.keycloak.Config.Scope config) {}
+    @Override public void postInit(org.keycloak.models.KeycloakSessionFactory factory) {}
+    @Override public void close() {}
+}
+```
+
+---
+
+### (c) `ExternalRoleApiClient.java`
+
+```java
+package com.spleenior.keycloak.rolevalidator;
+
+import org.apache.hc.client5.http.fluent.Request;
+import org.apache.hc.core5.http.HttpStatus;
+import org.json.JSONObject;
+
+public class ExternalRoleApiClient {
+
+    private static final String API_URL = System.getProperty("external.role.api", "https://internal.api/validateRole");
+
+    public RoleValidationResponse validateRole(String username, String role) {
+        try {
+            JSONObject req = new JSONObject();
+            req.put("username", username);
+            req.put("role", role);
+
+            String jsonResponse = Request.post(API_URL)
+                .addHeader("Authorization", "Bearer " + System.getenv("ROLE_API_TOKEN"))
+                .bodyString(req.toString(), null)
+                .execute()
+                .returnContent().asString();
+
+            JSONObject res = new JSONObject(jsonResponse);
+            if (res.optBoolean("valid", false)) {
+                return new RoleValidationResponse(
+                        true,
+                        res.optString("circleId", null),
+                        res.optString("branchId", null),
+                        res.optString("raccpId", null)
+                );
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return new RoleValidationResponse(false, null, null, null);
+    }
+}
+```
+
+---
+
+### (d) `RoleValidationResponse.java`
+
+```java
+package com.spleenior.keycloak.rolevalidator;
+
+public record RoleValidationResponse(boolean valid, String circleId, String branchId, String raccpId) {}
+```
+
+---
+
+### (e) `CaffeineCacheProvider.java`
+
+```java
+package com.spleenior.keycloak.rolevalidator;
+
+import com.github.benmanes.caffeine.cache.*;
+
+import java.util.concurrent.TimeUnit;
+
+public class CaffeineCacheProvider {
+
+    private static final Cache<String, Boolean> cache = Caffeine.newBuilder()
+            .expireAfterWrite(15, TimeUnit.MINUTES)
+            .maximumSize(10000)
+            .build();
+
+    private static final CaffeineCacheProvider INSTANCE = new CaffeineCacheProvider();
+    private CaffeineCacheProvider() {}
+    public static CaffeineCacheProvider getInstance() { return INSTANCE; }
+
+    public Boolean get(String key) { return cache.getIfPresent(key); }
+    public void put(String key, Boolean value) { cache.put(key, value); }
+}
+```
+
+---
+
+## 🧩 4. Authentication Flow XML (`external-role-validator-flow.xml`)
+
+```xml
+<authenticationFlow alias="browser-with-role-validation" description="Browser flow with external role validation" providerId="basic-flow" topLevel="true" builtIn="false">
+    <authenticationExecutions>
+        <!-- 1. Username and Password -->
+        <execution authenticator="auth-username-password-form" requirement="REQUIRED"/>
+
+        <!-- 2. External Role Validator -->
+        <execution authenticator="external-role-validator" requirement="REQUIRED"/>
+
+        <!-- 3. OTP / OTP Form if applicable -->
+        <execution authenticator="auth-otp-form" requirement="CONDITIONAL"/>
+    </authenticationExecutions>
+</authenticationFlow>
+```
+
+---
+
+## 🧰 5. Registering and Enabling the Flow in Keycloak
+
+### Step 1 — Deploy JAR
+
+Copy your compiled JAR:
+
+```bash
+cp target/external-role-validator-1.0.0.jar /opt/keycloak/providers/
+```
+
+### Step 2 — Restart Keycloak
+
+```bash
+/opt/keycloak/bin/kc.sh build
+/opt/keycloak/bin/kc.sh start --spi-theme-static-max-age=-1
+```
+
+### Step 3 — Configure Flow
+
+In **Admin Console**:
+
+1. Go to **Authentication → Flows**
+2. Create a new flow → *Import from XML* (select `external-role-validator-flow.xml`)
+3. Set as **Browser Flow** for your realm.
+
+---
+
+## 🧾 6. JWT Enrichment
+
+Add a **Protocol Mapper** in your client (OIDC Client):
+
+* Mapper type: “User Attribute”
+* Attribute name: `circleId`, `branchId`, `raccpId`
+* Token Claim Name: same as attribute
+* Include in Access Token: ✅ checked
+* Include in ID Token: ✅ checked
+
+So your JWT will include:
+
+```json
+{
+  "preferred_username": "pf12345",
+  "roles": ["COD"],
+  "circleId": "C001",
+  "branchId": "B123",
+  "raccpId": "RACPC99"
+}
+```
+
+---
+
+## 🧠 7. Production Tips
+
+| Concern            | Best Practice                                                  |
+| ------------------ | -------------------------------------------------------------- |
+| External API auth  | Use mTLS or signed JWT system token                            |
+| Timeout            | ≤3 seconds                                                     |
+| Fallback           | Deny login if API unreachable                                  |
+| Cache invalidation | Auto-expire after 15 mins                                      |
+| Secure config      | Set `external.role.api` and token in Keycloak startup env vars |
+
+---
+
+////////////////////////////////////
+
+
+
+Perfect follow-up — this is a **critical piece** in your architecture, because you’re combining **Keycloak’s local role management** with **external validation via an authoritative third-party API** (for example, a Core Banking, HRMS, or Role Registry API).
+
+Let’s break this down into a *secure, production-grade* design pattern:
+
+---
+
+## 🧩 Objective
+
+When a user (say, **CPC_HEAD** or **COD**) logs in:
+
+* Keycloak must **not blindly trust** the stored roles.
+* Instead, it must **validate** those roles against a **third-party API** (the source of truth).
+* If the role is still valid → continue login and issue JWT with that role.
+* If invalid (e.g. user transferred, revoked) → deny login or remove role claim.
+
+---
+
+## ⚙️ Architecture Overview
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                            Keycloak                             │
+│  ┌──────────────────────────┐   ┌────────────────────────────┐  │
+│  │ Custom Authenticator SPI │──▶│ External Role Validation   │  │
+│  │  (Execution in flow)     │   │  Service API (3rd Party)   │  │
+│  └──────────────────────────┘   └────────────────────────────┘  │
+│         ▲             │                                        │
+│         │             ▼                                        │
+│     LDAP Bind     Token Issuance                               │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Key Components:
+
+1. **Custom Authenticator SPI** → runs during authentication flow.
+2. **External API** → REST endpoint that validates user role and mapping.
+3. **Role Sync/Override Logic** → updates user attributes/roles dynamically.
+
+---
+
+## 🧠 Step-by-Step Flow (CPC Head / COD Login)
+
+### 1️⃣ User enters credentials
+
+* Internal user authenticates via **LDAP bind** (or external via OTP, depending on user type).
+* If credentials are valid, Keycloak proceeds to **Custom Authenticator**.
+
+---
+
+### 2️⃣ Custom Authenticator SPI runs
+
+* This is a **Java class** implementing `Authenticator` interface in Keycloak SPI.
+* It’s executed as a step in your **authentication flow** (after LDAP or OTP validation, before issuing tokens).
+
+**Key Steps inside SPI:**
+
+```java
+public void authenticate(AuthenticationFlowContext context) {
+    String username = context.getUser().getUsername();
+    String role = context.getUser().getFirstAttribute("primaryRole"); // e.g. COD or CPC_HEAD
+    String apiUrl = "https://thirdparty-system/api/validateRole";
+
+    HttpResponse<String> response = Unirest.post(apiUrl)
+        .header("Authorization", "Bearer " + SYSTEM_TOKEN)
+        .body("{\"username\":\"" + username + "\",\"role\":\"" + role + "\"}")
+        .asString();
+
+    if (response.getStatus() == 200 && response.getBody().contains("\"valid\":true")) {
+        // ✅ Role verified
+        context.success();
+    } else {
+        // ❌ Invalid or expired role
+        context.cancelLogin();
+        context.failure(AuthenticationFlowError.INVALID_USER,
+            context.form().setError("Your current role is not authorized for login.").createErrorPage());
+    }
+}
+```
+
+---
+
+### 3️⃣ External Role Validation API
+
+* The **third-party API** receives:
+
+  ```json
+  {
+    "username": "pf12345",
+    "role": "COD"
+  }
+  ```
+* It checks in its authoritative source (e.g. HRMS / Circle Mapping DB) whether:
+
+  * User exists in that role,
+  * Branch/Circle assignment still valid,
+  * Role active (not transferred/disabled).
+* Returns:
+
+  ```json
+  {
+    "valid": true,
+    "circleId": "C001",
+    "branchId": "B123",
+    "raccpId": "RACPC99",
+    "role": "COD"
+  }
+  ```
+
+---
+
+### 4️⃣ Keycloak updates user data dynamically
+
+If API confirms validity:
+
+* Update Keycloak **user attributes** and **roles** for accurate JWT content:
+
+  ```java
+  user.setSingleAttribute("circleId", response.circleId());
+  user.setSingleAttribute("branchId", response.branchId());
+  user.setSingleAttribute("raccpId", response.raccpId());
+  user.setSingleAttribute("validatedBy", "external-role-api");
+  ```
+
+* Assign the verified role dynamically:
+
+  ```java
+  RoleModel roleModel = realm.getRole(role);
+  if (!user.hasRole(roleModel)) user.grantRole(roleModel);
+  ```
+
+If invalid → authentication fails (user never receives JWT).
+
+---
+
+### 5️⃣ JWT Issuance
+
+* After success, Keycloak issues token with:
+
+  * Standard claims: `sub`, `preferred_username`
+  * Role claim: `roles: ["COD"]`
+  * Location claims: from user attributes (`circleId`, `raccpId`)
+* Resource servers can trust this JWT because the **role was freshly verified** at login time.
+
+---
+
+## 🔄 Optional Optimization — Cached Role Validation
+
+If you want to reduce load on the external API:
+
+* Add **short-term caching** (e.g. 15 mins) using:
+
+  * Redis, or
+  * Java `Caffeine` inside Keycloak SPI.
+
+Example:
+
+```java
+Cache<String, Boolean> cache = Caffeine.newBuilder()
+    .expireAfterWrite(15, TimeUnit.MINUTES)
+    .maximumSize(10000)
+    .build();
+
+Boolean cachedResult = cache.getIfPresent(username + "_" + role);
+if (cachedResult == null) {
+    // call API
+    cache.put(username + "_" + role, apiResponse.isValid());
+}
+```
+
+This balances **performance** and **security**.
+
+---
+
+## 🔐 Security Considerations
+
+| Concern                         | Mitigation                                    |
+| ------------------------------- | --------------------------------------------- |
+| **External API unavailability** | Fallback: deny login or use cached validation |
+| **API spoofing / MITM**         | Mutual TLS or signed JWT (Keycloak → API)     |
+| **Sensitive data leak**         | Use POST + HTTPS only                         |
+| **Timeout impact**              | Set short connect/read timeouts (2–3s)        |
+| **Abuse**                       | Rate-limit requests from Keycloak node        |
+
+---
+
+## 📦 Deployment Integration
+
+| Component                  | Type         | Location                                     |
+| -------------------------- | ------------ | -------------------------------------------- |
+| Keycloak Authenticator SPI | Custom JAR   | `/opt/keycloak/providers/`                   |
+| Config                     | JSON/YAML    | `/opt/keycloak/conf/external-role-check.yml` |
+| Third-Party Role API       | Microservice | internal network (behind API Gateway)        |
+
+---
+
+## ✅ Summary
+
+| Feature                    | Implementation                        |
+| -------------------------- | ------------------------------------- |
+| Verify role (COD/CPC_HEAD) | Custom Keycloak Authenticator SPI     |
+| Validation source          | External REST API (3rd-party)         |
+| Login blocked if invalid   | `context.failure()` in SPI            |
+| JWT enrichment             | Mappers add roles + circle/branch IDs |
+| Optional caching           | Caffeine / Redis                      |
+| Secure integration         | Mutual TLS or signed system token     |
+
+---
+
+Would you like me to show the **exact SPI project structure and Keycloak flow XML configuration** (`authenticationFlowExecution` for this step) next?
+That’ll make it easy to plug this directly into your running Keycloak instance.
+
+
+
+
+
+
+
+///////////////////////////////////////////
+
+
+
+Excellent question — let’s go step-by-step.
+We’ll break this into **three parts**:
+
+1. **Maker–Checker-controlled user creation workflow** (business logic outside Keycloak)
+2. **How Keycloak login is *blocked until checker approval*** (integration design)
+3. **How role and location data flow into JWT claims** after approval.
+
+---
+
+## 🧩 1. Maker–Checker-Controlled User Creation Flow
+
+### ✅ Purpose
+
+Keycloak shouldn’t directly create users as soon as a “maker” submits them — because we need approval, validation (HRMS API, role rules), and mapping.
+So we separate *user registration (proposed state)* from *user activation (approved state)*.
+
+### ⚙️ Workflow
+
+#### (A) Maker submission
+
+1. **Maker UI (Angular)** → **User Service API (Spring Boot)** sends a `CreateUserRequest` payload:
+
+   ```json
+   {
+     "username": "pf12345",
+     "userType": "INTERNAL",
+     "roleIds": ["COD"],
+     "circleId": "C001",
+     "raccpMappings": [...],
+     "mobile": "...",
+     "email": "...",
+     "createdBy": "maker123"
+   }
+   ```
+
+2. User Service performs validations:
+
+   * Internal users: fetch HRMS details using PF ID (email, branch, designation, ESG/EG).
+   * External users: verify mobile/email uniqueness.
+   * Apply **conditional role rules** (CIT, SIO, etc.).
+   * If all validations pass → store record in `pending_user` table with status `PENDING_APPROVAL`.
+
+3. If external user → generate temporary password (hashed) and store it.
+
+   * **No call to Keycloak yet.**
+   * Send notification to Checker (via email or dashboard event).
+
+---
+
+#### (B) Checker review
+
+1. Checker logs into UI → sees pending users (filtered by Circle, role, or RACPC).
+2. Checker reviews data and either:
+
+   * **Rejects** → status = `REJECTED`, audit logged.
+   * **Approves** → triggers backend flow below.
+
+#### (C) On approval
+
+When Checker approves:
+
+1. The User Service:
+
+   * Changes record to status = `APPROVED`.
+   * Creates actual user in **Keycloak** via **Admin REST API**:
+
+     * POST `/admin/realms/{realm}/users`
+     * Set `enabled=true`.
+     * Attributes: branch, circle, role codes, userType, RACPC, etc.
+     * Assign realm roles or client roles matching the assigned roles.
+     * Optionally, send a temporary password (if external user).
+
+2. Keycloak now has a real user who can authenticate.
+
+3. Publish event to Kafka → for audit and downstream systems.
+
+---
+
+## 🚫 2. How to Block Login Until Checker Approval
+
+There are two clean ways to ensure *only approved users can log in*:
+
+### 🧠 Option 1 — Create user in Keycloak *disabled* (`enabled=false`) during Maker step
+
+* When Maker submits, we still pre-create user in Keycloak (disabled) so the username is reserved.
+* On Checker approval, backend calls Keycloak Admin API:
+
+  ```http
+  PUT /admin/realms/{realm}/users/{id}
+  {
+    "enabled": true
+  }
+  ```
+* Disabled users automatically fail authentication (Keycloak rejects login with “Account disabled” error).
+* No change needed in Keycloak login flow.
+
+✅ **Pros:** Simple and uses built-in Keycloak behavior.
+⚠️ **Cons:** Slightly more API calls if user data is frequently edited before approval.
+
+---
+
+### 🧠 Option 2 — Delay Keycloak creation until approval
+
+* Only store user in local DB (`pending_user` table).
+* Keycloak knows nothing until Checker approves.
+* On approval → Keycloak Admin API creates a new `enabled=true` user.
+* Until then, login attempt fails (Keycloak doesn’t find username).
+
+✅ **Pros:** No inactive accounts clutter Keycloak.
+⚠️ **Cons:** Requires handling “user not found” gracefully at login.
+
+---
+
+### 🔐 Recommendation:
+
+* Use **Option 1** for internal users (pre-create disabled users in Keycloak)
+* Use **Option 2** for external users (simpler and more secure for onboarding).
+
+---
+
+## 🧾 3. How Roles & Location Details Go Into JWT
+
+### 🔸 Source of Role/Location Data
+
+* When Checker approves, the User Service knows:
+
+  * **Roles:** from Maker’s selection and validation.
+  * **Location hierarchy:** Circle, RACPC, Branch, CPC, BPR Center, etc.
+* These must appear in the JWT claims so the resource servers can apply authorization rules without extra DB queries.
+
+### 🔸 During Keycloak User Creation (approval stage)
+
+When the User Service calls Keycloak Admin API, it sets:
+
+```json
+{
+  "attributes": {
+    "circleId": "C001",
+    "branchId": "B123",
+    "raccpId": "RACPC99",
+    "userType": "INTERNAL",
+    "roleCodes": "COD,CPC_HEAD"
+  },
+  "realmRoles": ["COD", "CPC_HEAD"]
+}
+```
+
+Keycloak stores these as user attributes.
+
+---
+
+### 🔸 Mapping attributes into JWT
+
+In the Keycloak **Realm → Client → Mappers**:
+
+1. **Realm Role Mapper**
+
+   * Map assigned realm roles → `roles` claim in JWT.
+   * Claim name: `roles`
+   * Token Claim JSON Type: `String` or `List`
+   * Add to Access Token and ID Token.
+
+2. **User Attribute Mappers** for:
+
+   * `circleId` → claim `circle_id`
+   * `branchId` → claim `branch_id`
+   * `raccpId` → claim `raccp_id`
+   * `userType` → claim `user_type`
+   * etc.
+
+3. You can also combine them in one JSON claim using a **script mapper**:
+
+   ```js
+   var attr = user.getAttributes();
+   var obj = {};
+   obj.circleId = attr.get("circleId") != null ? attr.get("circleId").get(0) : null;
+   obj.branchId = attr.get("branchId") != null ? attr.get("branchId").get(0) : null;
+   obj.roles = user.getRoleMappings().stream().map(r => r.getName()).toArray();
+   obj.userType = attr.get("userType") != null ? attr.get("userType").get(0) : null;
+   obj.email = user.getEmail();
+   obj.username = user.getUsername();
+   obj.displayName = user.getFirstName() + ' ' + user.getLastName();
+   exports = obj;
+   ```
+
+   * Claim name: `user_context`
+   * Add to Access Token: ✅ Yes
+   * Add to ID Token: ✅ Yes
+
+The resulting JWT will include:
+
+```json
+{
+  "preferred_username": "pf12345",
+  "roles": ["COD", "CPC_HEAD"],
+  "user_context": {
+    "circleId": "C001",
+    "branchId": "B123",
+    "raccpId": "RACPC99",
+    "userType": "INTERNAL",
+    "email": "user@example.com"
+  }
+}
+```
+
+---
+
+## 🔁 End-to-End Example
+
+| Step | Actor           | Action                          | Result                                                                   |
+| ---- | --------------- | ------------------------------- | ------------------------------------------------------------------------ |
+| 1    | Maker           | Submits internal user `pf12345` | Stored in `pending_user`, Keycloak user created disabled                 |
+| 2    | Checker         | Approves                        | Keycloak user enabled, roles and attributes added                        |
+| 3    | User            | Logs in                         | Keycloak allows login, validates LDAP, issues JWT with mapped attributes |
+| 4    | Resource Server | Validates JWT                   | Uses claims like `roles`, `circle_id` to authorize                       |
+
+---
+
+## ✅ Summary
+
+| Concern                        | Solution                                                                                    |
+| ------------------------------ | ------------------------------------------------------------------------------------------- |
+| **Maker vs Checker control**   | Store user in pending state; only Checker approval triggers Keycloak creation or activation |
+| **Block login until approval** | Keycloak user disabled (enabled=false) or not created until approved                        |
+| **Role & location in JWT**     | Add user attributes in Keycloak → map to JWT using mappers or script mapper                 |
+| **Authorization checks**       | Resource servers use JWT claims for role and location validation                            |
+
+---
+
+Would you like me to **draw a sequence diagram** showing Maker → Checker → Keycloak → Login → JWT issue flow next?
+That visual helps clarify where “approval” gates the login path.
+
+
+
+
+
+
+
+
+
+
