@@ -2423,4 +2423,437 @@ Using a custom header is more explicit and simpler for the server-side filter to
 Section IX: Future-State Considerations9.1. Seamless SSO (Kerberos)The future plan to enable seamless SSO for internal users via Kerberos is a well-supported integration path in Keycloak.138Implementation Path:Active Directory: A Service Principal Name (SPN) must be created in AD for the Keycloak service, and a corresponding keytab file must be generated and securely transferred to the Keycloak server.139Keycloak (User Federation): A new "Kerberos" provider will be added to the realm's User Federation configuration.140 It will be configured with the server's SPN and the path to the keytab file.Keycloak (Authentication Flow): The custom "Internal" authentication sub-flow (from Section 2.3) will be modified. The Kerberos execution will be added as the first step (set to "Alternative").Resulting User Experience: When an internal user, already logged into their domain-joined Windows machine, accesses the Angular application, their browser will automatically perform a SPNEGO challenge-response.138 Keycloak will receive and validate the Kerberos ticket.14 If successful, the user is authenticated instantly and seamlessly, completely bypassing the CAPTCHA, username/password form, and any other login steps. If Kerberos fails, the flow simply continues to the CAPTCHA and password form as a fallback.
 
 
+///////////////////////////////////////////////
 
+
+
+
+
+# Complete Keycloak 26.4.2 Configuration Guide for OAuth 2.1 with PKCE and DPoP
+
+## Part 1: Docker Setup
+
+### Step 1: Create Docker Compose File
+
+Create a file named `docker-compose.yml`:
+
+```yaml
+version: '3.8'
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0.4
+    container_name: keycloak-oauth21
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HTTP_PORT: 8080
+      KC_HOSTNAME_STRICT: false
+      KC_HOSTNAME_STRICT_HTTPS: false
+      KC_HTTP_ENABLED: true
+      KC_HEALTH_ENABLED: true
+      KC_METRICS_ENABLED: true
+      KC_LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    command:
+      - start-dev
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  keycloak_data:
+    driver: local
+```
+
+### Step 2: Start Keycloak
+
+```bash
+# Navigate to the directory with docker-compose.yml
+cd /path/to/your/keycloak/directory
+
+# Start Keycloak
+docker-compose up -d
+
+# Check if it's running
+docker-compose ps
+
+# Watch the logs (wait for "Listening on: http://0.0.0.0:8080")
+docker-compose logs -f keycloak
+
+# Press Ctrl+C to exit logs when you see Keycloak is ready
+```
+
+Wait approximately 30-60 seconds for Keycloak to fully start.
+
+### Step 3: Access Keycloak Admin Console
+
+1. Open your browser and navigate to: `http://localhost:8080`
+2. Click **"Administration Console"**
+3. Login with:
+   - **Username**: `admin`
+   - **Password**: `admin`
+
+---
+
+## Part 2: Realm Configuration
+
+### Step 4: Create a New Realm
+
+1. Click the **realm dropdown** in the top-left corner (shows "Keycloak" or "master")
+2. Click **"Create realm"**
+3. Fill in the details:
+   - **Realm name**: `secure-app-realm`
+   - **Enabled**: `ON` (toggle should be on/blue)
+4. Click **"Create"**
+
+You should now see "secure-app-realm" in the realm dropdown.
+
+---
+
+## Part 3: Client Configuration (OAuth 2.1 with PKCE & DPoP)
+
+### Step 5: Create Client - General Settings (Page 1 of 3)
+
+1. In the left sidebar, click **"Clients"**
+2. Click **"Create client"** button (top right)
+
+**On the "General settings" page:**
+
+3. **Client type**: Select `OpenID Connect` (should be selected by default)
+4. **Client ID**: `angular-oauth-app`
+5. **Name** (optional): `Angular OAuth 2.1 Application`
+6. **Description** (optional): `Angular SPA with PKCE and DPoP`
+7. Click **"Next"**
+
+---
+
+### Step 6: Create Client - Capability Config (Page 2 of 3) ⚠️ CRITICAL
+
+**On the "Capability config" page:**
+
+#### Client Authentication:
+- **Client authentication**: `OFF` ✅
+  - (Toggle should be OFF/gray - this makes it a public client suitable for SPAs)
+
+#### Authorization:
+- **Authorization**: `OFF` ✅
+  - (Toggle should be OFF/gray)
+
+#### Authentication Flow:
+**ONLY check "Standard flow":**
+
+- ☑️ **Standard flow** ✅ (CHECK THIS - this is the Authorization Code Flow)
+- ☐ **Direct access grants** ❌ (UNCHECK THIS - not secure for SPAs!)
+- ☐ **Implicit flow** ❌ (UNCHECK - deprecated in OAuth 2.1)
+- ☐ **Service accounts roles** ❌ (UNCHECK - not needed for SPAs)
+- ☐ **Standard Token Exchange** ❌ (UNCHECK)
+- ☐ **OAuth 2.0 Device Authorization Grant** ❌ (UNCHECK)
+- ☐ **OIDC CIBA Grant** ❌ (UNCHECK)
+
+#### PKCE Method: ⚠️ REQUIRED
+- **PKCE Method**: Select `S256` from the dropdown ✅
+  - Click the dropdown and select **S256** (SHA-256 hashing)
+  - Do NOT select "plain" - only S256 is secure
+
+#### Require DPoP Bound Tokens: ⚠️ REQUIRED
+- **Require DPoP bound tokens**: Toggle `ON` ✅
+  - Click the toggle to turn it ON (should turn blue/show "On")
+
+**Your configuration should look like this:**
+```
+Client authentication:        OFF
+Authorization:                OFF
+
+Authentication flow:
+☑ Standard flow              ← ONLY THIS ONE CHECKED
+☐ Direct access grants
+☐ Implicit flow
+☐ Service accounts roles
+☐ Standard Token Exchange
+☐ OAuth 2.0 Device Authorization Grant
+☐ OIDC CIBA Grant
+
+PKCE Method:                 S256 ▼
+Require DPoP bound tokens:   [ON] (blue/enabled)
+```
+
+8. Click **"Next"**
+
+---
+
+### Step 7: Create Client - Login Settings (Page 3 of 3)
+
+**On the "Login settings" page:**
+
+#### URLs Configuration:
+
+1. **Root URL**: 
+   ```
+   http://localhost:4200
+   ```
+
+2. **Home URL** (optional): Leave empty or use:
+   ```
+   http://localhost:4200
+   ```
+
+3. **Valid redirect URIs**: Add these (click "+ Add valid redirect URI" for each):
+   ```
+   http://localhost:4200/*
+   http://localhost:4200/callback
+   ```
+
+4. **Valid post logout redirect URIs**: Add these:
+   ```
+   http://localhost:4200/*
+   http://localhost:4200
+   ```
+
+5. **Web origins**: Add this (for CORS):
+   ```
+   http://localhost:4200
+   ```
+   Or use:
+   ```
+   +
+   ```
+   (The `+` symbol means "allow all origins that match redirect URIs")
+
+6. Click **"Save"**
+
+You'll be taken to the client details page.
+
+---
+
+### Step 8: Configure Advanced Client Settings
+
+After saving, you're on the client details page. Now configure additional security settings:
+
+#### 8.1 Advanced Tab
+
+1. Click the **"Advanced"** tab at the top of the client details page
+
+2. Scroll down and configure these settings:
+
+**OAuth 2.1 Settings (should already be set from Step 6, but verify):**
+- **Proof Key for Code Exchange Code Challenge Method**: `S256` ✅
+- **OAuth 2.0 DPoP Bound Access Tokens**: `ON` ✅
+
+**Access Token Settings:**
+- **Access Token Lifespan**: `5 Minutes` ✅
+  - This overrides realm default for this client
+  - Short-lived tokens are more secure
+
+**Refresh Token Settings:**
+- **Client Session Idle**: `30 Minutes`
+- **Client Session Max**: `10 Hours`
+
+**Advanced OpenID Connect Configuration:**
+- **Access Token Lifespan For Implicit Flow**: Leave default (we're not using implicit flow)
+
+**OAuth 2.0 Mutual TLS:**
+- **OAuth 2.0 Mutual TLS Certificate Bound Access Tokens Enabled**: `OFF`
+  - (We're using DPoP instead of mTLS)
+
+**Pushed Authorization Requests (PAR):**
+- **Pushed Authorization Request Required**: `OFF` (optional feature)
+
+3. Scroll to the bottom and click **"Save"**
+
+---
+
+### Step 9: Configure Realm Token Settings
+
+1. In the left sidebar, click **"Realm settings"**
+2. Click the **"Tokens"** tab
+
+**Configure these settings:**
+
+**General:**
+- **Default Signature Algorithm**: `RS256` (should be default)
+
+**Access Tokens:**
+- **Access Token Lifespan**: `5 Minutes` ✅
+- **Access Token Lifespan For Implicit Flow**: `15 Minutes`
+
+**Refresh Tokens:**
+- **Refresh Token Max Reuse**: `0` ✅ (one-time use only)
+- **Revoke Refresh Token**: `ON` ✅ (toggle should be blue/enabled)
+
+**Session Settings:**
+- **SSO Session Idle**: `30 Minutes`
+- **SSO Session Max**: `10 Hours`
+
+3. Click **"Save"**
+
+---
+
+### Step 10: Configure Security Defenses
+
+1. Still in **"Realm settings"**, click the **"Security defenses"** tab
+
+**Headers Section:**
+- **X-Frame-Options**: `SAMEORIGIN`
+- **Content-Security-Policy**: (leave default or customize as needed)
+- **Content-Security-Policy-Report-Only**: (leave empty)
+- **X-Content-Type-Options**: `nosniff`
+- **X-Robots-Tag**: `none`
+- **X-XSS-Protection**: `1; mode=block`
+- **Strict-Transport-Security**: Leave empty (enable in production with HTTPS)
+
+**Brute Force Detection:**
+- **Enabled**: `ON` ✅ (toggle on/blue)
+- **Permanent lockout**: `OFF`
+- **Max login failures**: `5`
+- **Wait increment**: `60 Seconds`
+- **Quick login check milliseconds**: `1000`
+- **Minimum quick login wait**: `60 Seconds`
+- **Max wait**: `15 Minutes`
+- **Failure reset time**: `12 Hours`
+
+2. Click **"Save"**
+
+---
+
+## Part 4: User Configuration
+
+### Step 11: Create Test User
+
+1. In the left sidebar, click **"Users"**
+2. Click **"Add user"** button
+
+**User Details:**
+3. **Username**: `testuser` ✅ (required)
+4. **Email**: `testuser@example.com`
+5. **First name**: `Test`
+6. **Last name**: `User`
+7. **Email verified**: Toggle `ON` ✅ (turn it blue/enabled)
+8. **Enabled**: Should be `ON` by default ✅
+
+9. Click **"Create"**
+
+### Step 12: Set User Password
+
+After creating the user, you'll be on the user details page:
+
+1. Click the **"Credentials"** tab
+2. Click **"Set password"** button
+
+**Password Configuration:**
+3. **Password**: `Test123!`
+4. **Password confirmation**: `Test123!`
+5. **Temporary**: Toggle `OFF` ✅ (so user doesn't need to change password on first login)
+
+6. Click **"Save"**
+7. In the confirmation dialog, click **"Save password"**
+
+---
+
+## Part 5: Verification
+
+### Step 13: Verify OpenID Configuration
+
+1. Open a new browser tab and visit:
+   ```
+   http://localhost:8080/realms/secure-app-realm/.well-known/openid-configuration
+   ```
+
+2. **Verify these fields are present** in the JSON response:
+
+**DPoP Support:**
+```json
+"dpop_signing_alg_values_supported": ["RS256", "PS256", "ES256"]
+```
+
+**PKCE Support:**
+```json
+"code_challenge_methods_supported": ["plain", "S256"]
+```
+
+**Supported Grant Types:**
+```json
+"grant_types_supported": [
+  "authorization_code",
+  "implicit",
+  "refresh_token",
+  "password",
+  "client_credentials",
+  "urn:ietf:params:oauth:grant-type:device_code",
+  "urn:openid:params:grant-type:ciba"
+]
+```
+(Note: Even though these are listed, your client is configured to ONLY use `authorization_code`)
+
+**Authorization Endpoint:**
+```json
+"authorization_endpoint": "http://localhost:8080/realms/secure-app-realm/protocol/openid-connect/auth"
+```
+
+**Token Endpoint:**
+```json
+"token_endpoint": "http://localhost:8080/realms/secure-app-realm/protocol/openid-connect/token"
+```
+
+### Step 14: Verify Client Configuration
+
+1. Go back to Keycloak Admin Console
+2. Navigate to **Clients** → **angular-oauth-app**
+3. Verify the **Settings** tab shows:
+   - ✅ Client authentication: OFF
+   - ✅ Standard flow: ENABLED
+   - ✅ Direct access grants: DISABLED
+   - ✅ Valid redirect URIs: `http://localhost:4200/*`
+   - ✅ Web origins: `http://localhost:4200`
+
+4. Click the **Advanced** tab and verify:
+   - ✅ PKCE Code Challenge Method: S256
+   - ✅ OAuth 2.0 DPoP Bound Access Tokens: ON
+   - ✅ Access Token Lifespan: 5 Minutes
+
+---
+
+## Configuration Summary
+
+### ✅ What You've Configured:
+
+| Component | Setting | Value | Purpose |
+|-----------|---------|-------|---------|
+| **Realm** | Name | secure-app-realm | Isolation boundary |
+| **Client Type** | Protocol | OpenID Connect | OAuth 2.0/OIDC |
+| **Client Auth** | Type | Public (OFF) | SPA cannot keep secrets |
+| **Flow** | Enabled | Standard Flow only | Authorization Code Flow |
+| **Flow** | Disabled | Direct Access, Implicit | Security - deprecated flows |
+| **PKCE** | Method | S256 | SHA-256 code challenge |
+| **DPoP** | Enabled | ON | Token binding |
+| **Access Token** | Lifespan | 5 minutes | Short-lived for security |
+| **Refresh Token** | Reuse | 0 (one-time) | Prevent replay attacks |
+| **User** | Username | testuser | Test account |
+| **User** | Password | Test123! | Test credentials |
+
+---
+
+## Next Steps
+
+Your Keycloak is now fully configured! The key security features enabled are:
+
+1. ✅ **OAuth 2.1 Compliance**: Only secure flows enabled
+2. ✅ **PKCE with S256**: Protection against code interception
+3. ✅ **DPoP**: Token binding to cryptographic keys
+4. ✅ **Short-lived tokens**: 5-minute access token lifespan
+5. ✅ **One-time refresh tokens**: Refresh token reuse = 0
+6. ✅ **Brute force protection**: Account lockout after failed attempts
+7. ✅ **CORS configuration**: Proper web origins setup
+
+Now you can proceed with the Angular 20 implementation that will connect to this Keycloak instance!
+
+**Test your configuration:**
+- Keycloak Admin: `http://localhost:8080/admin`
+- Realm endpoint: `http://localhost:8080/realms/secure-app-realm`
+- Login: `testuser` / `Test123!`
